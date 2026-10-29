@@ -1,0 +1,319 @@
+---
+title: "同一份資料，三個引擎：dexter、immer 和成對的 CCML"
+format:
+  html:
+    toc: true
+    grid:
+      body-width: 1000px
+vignette: >
+  %\VignetteIndexEntry{同一份資料，三個引擎：dexter、immer 和成對的 CCML}
+  %\VignetteEngine{quarto::html}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include = FALSE}
+needed <- c("immer", "dplyr", "tidyr", "purrr")
+has_all <- all(vapply(needed, requireNamespace, logical(1), quietly = TRUE))
+knitr::opts_chunk$set(collapse = TRUE, comment = "#>", message = FALSE, eval = has_all)
+options(width = 110)
+```
+
+```{r, eval = !has_all, echo = FALSE, results = "asis"}
+cat("這份文件需要 immer、dplyr、tidyr、purrr；沒有全部安裝，所以程式沒有執行。\n")
+```
+
+kitsPreview 是教學用的薄包裝。
+它回答一個問題：這一步，直接用 dexter、immer 或 cNORM 要怎麼做。
+每個包裝只跑幾行原本套件的程式，換成同一種表，再留下套件自己的結果。
+最佳化過的版本是另一個套件 kits（用 RTMB 寫）。
+
+這份文件用一份模擬的不完整設計資料，把三個引擎各跑一次。
+dexter 和 immer 是條件最大概似（CML）；`"ccml"` 是 immer 的成對條件概似（CCML），GSED 的 D-score 用的方法。
+
+| 函數 | `engine =` | 套件、方法 |
+|---|---|---|
+| `kits_item()` | `"dexter"`（預設） | dexter `fit_enorm()`，CML |
+| | `"immer"` | immer `immer_cml()`，CML |
+| | `"ccml"` | immer `immer_ccml()`，成對的 CCML（GSED 的方法） |
+| `kits_subj()` | （沒有引擎） | dexter `ability()`，WLE |
+| `kits_linking()` | （沒有引擎） | mean/sigma 加篩點，base R |
+
+```{r}
+library(kitsPreview)
+library(dplyr)
+library(tidyr)
+library(purrr)
+```
+
+
+## 1 模擬資料
+
+三個波次（6、12、24 個月），每個波次 500 人。
+三個波次的能力平均不同：−1.5、0、1.5。
+每個波次答不同的一段題目：小的答容易的題，大的答難的題。
+這就是 KIT 的設計：作答組合（item pattern：答了哪幾題）跟著月齡走，月齡又和能力有關。
+
+```{r}
+betas <- list(a1 = c(-2.5, -1.5), a2 = c(-2, -1), a3 = c(-1.5, -0.5, 0.5), a4 = -0.5,
+              a5 = c(-0.5, 0.5), a6 = 0.5, a7 = c(0.5, 1.5), a8 = c(1, 2), a9 = 2)
+wave <- rep(c(6, 12, 24), each = 500)
+wave_mean <- c(`6` = -1.5, `12` = 0, `24` = 1.5)
+set.seed(1)
+theta <- wave_mean[as.character(wave)] + rnorm(length(wave))
+```
+
+```{r}
+X <- kits_sim(theta, betas, seed = 2)
+X[wave == 6, c("a7", "a8", "a9")] <- NA
+X[wave == 12, c("a1", "a9")] <- NA
+X[wave == 24, c("a1", "a2", "a3")] <- NA
+dim(X)
+```
+
+每個波次答了哪些題：
+
+```{r}
+as_tibble(!is.na(X)) |>
+  mutate(wave = wave) |>
+  summarise(across(everything(), sum), .by = wave)
+```
+
+
+## 2 兩個引擎各跑一次
+
+```{r}
+item_dexter <- kits_item(X)
+item_immer <- kits_item(X, engine = "immer")
+item_immer
+```
+
+兩個結果是同一種表：`item_id`、`item_score`、`beta`、`beta_se`、`thr`、`thr_se`。
+每個結果也留著套件自己的物件：`kits_original(x)`。
+
+```{r}
+items <- list(dexter = item_dexter, immer = item_immer)
+map_chr(items, \(item) class(kits_original(item))[1])
+```
+
+### 原點
+
+PCM 只定了單位（斜率是 1），沒有定原點。
+所有的 β 和所有的能力加同一個常數，機率不變。
+每個套件自己選原點：
+
+* dexter：所有 β 的和是 0。
+* immer（`normalization = "sum"`）：它累加參數的某種和是 0。
+
+為了能比較，`kits_item()` 把 immer 放到 dexter 的原點：每個 β 減掉全部 β 的平均。
+減掉的常數記在 `shift`。
+門檻跟著移動同一個常數。
+
+```{r}
+map_dbl(items, "shift")
+map_dbl(items, \(item) sum(coef(item)$beta))
+```
+
+
+## 3 並排的表
+
+每個步驟一列，每個引擎一欄。
+
+```{r}
+beta_of <- function(item, engine) {
+  as.data.frame(coef(item)) |>
+    as_tibble() |>
+    select(item_id, item_score, beta) |>
+    mutate(engine = engine)
+}
+```
+
+```{r}
+steps <- imap(items, beta_of) |>
+  list_rbind() |>
+  pivot_wider(names_from = engine, values_from = beta)
+steps |>
+  mutate(across(dexter:immer, \(x) round(x, 4)))
+```
+
+和 dexter 最大的差距：
+
+```{r}
+max_abs <- function(x, y) max(abs(x - y))
+c(beta = max_abs(coef(item_immer)$beta, coef(item_dexter)$beta),
+  thr = max_abs(coef(item_immer)$thr, coef(item_dexter)$thr),
+  beta_se = max_abs(coef(item_immer)$beta_se, coef(item_dexter)$beta_se))
+```
+
+這份模擬資料上，immer 和 dexter 差不到 1e-4。
+兩個是同一個 CML，差別只是最佳化停下來的地方：immer 用 `optim()`（BFGS），dexter 用自己的 iterative scaling 再 Newton-Raphson，收斂的標準也不同。
+所以差多少要看資料：KIT 語言 M03 的真實資料上 β 最大差 9.2e-4；
+kits 的示範資料 `kits::kitm03` 的語言上最大差 0.017（約 0.05 個 SE）。
+
+
+## 4 到最佳化的誤差為止都相同
+
+dexter 和 immer 最大化的是同一個條件概似。
+把 immer 的收斂標準調嚴，差距就更小：
+
+```{r}
+item_immer_tight <- kits_item(X, engine = "immer", control = list(reltol = 1e-14, maxit = 5000))
+c(default = max_abs(coef(item_immer)$beta, coef(item_dexter)$beta),
+  tight = max_abs(coef(item_immer_tight)$beta, coef(item_dexter)$beta))
+```
+
+### immer 的 `use_rcpp`
+
+immer 有比較快的 `use_rcpp = TRUE`。
+`kits_item()` 不用它。
+在一份 KIT 大小的模擬設計（47,000 個人次、24 題）上，它停在離最大值很遠的地方（離 CML 1.96 logit），卻回報已經收斂。
+所以 kitsPreview 用 immer 預設的 `optim()`（BFGS）。
+
+
+## 5 為什麼 CML 不需要母體的模型
+
+CML 以每個孩子在自己作答組合上的原始分為條件（dexter 把作答組合叫 booklet）。
+PCM 裡，原始分是能力 θ 的充分統計量。
+所以 θ 從條件概似裡消掉了。
+CML 不假設母體的分佈。
+孩子拿到哪個作答組合，也不影響估計。
+所以在 KIT 的設計下（作答組合由月齡決定，月齡又和 θ 有關），CML 沒有偏誤。
+
+邊際最大概似（MML，例如 TAM 的 `tam.mml()`）不一樣：它把 θ 在一個假設的母體分佈上積分掉。
+全部的人用一個常態時，模型不知道小的孩子能力低、大的孩子能力高，題目參數就會偏（Mislevy & Wu, 1996）。
+TAM 的 MML 要每個波次一個母體（`group = wave`），才會接近 CML。
+CML 等於「每個作答組合的原始分分佈完全自由」的 MML（de Leeuw & Verhelst, 1986；Follmann, 1988；Lindsay, Clogg & Grego, 1991；另見 Eggen & Verhelst, 2011；Zwitser & Maris, 2015）。
+TAM 的 MML 和 `group = wave` 的比較，在另一份教學文件裡；kitsPreview 不包 TAM。
+
+一句話：MML 需要把『誰拿到哪個作答組合』的原因放進模型；CML 不需要，因為它在每個作答組合內以原始分為條件。
+
+所以 KIT 用 CML。
+
+
+## 6 原本套件的輸出
+
+`summary()` 先印 kitsPreview 整理過的表，再印套件自己的 `summary()`，中間用一行標出來。
+
+```{r}
+summary(item_immer)
+```
+
+`print(x, original = TRUE)` 一樣。
+套件自己的輸出照原樣印，只拿掉 immer 的 `summary()` 印的電腦名字和帳號那一行（`nodename=`、`login=`）。
+套件自己的物件用 `kits_original()` 拿，再用那個套件的工具讀：
+
+```{r}
+fit_immer <- kits_original(item_immer)
+head(fit_immer$b)
+```
+
+
+## 7 每個引擎，原本的幾行程式
+
+這一節不用 kitsPreview：直接用原本的套件，算出和 `kits_item()` 一樣的數字。
+`kits_code(x)` 會寫出同樣的程式（可以直接執行的完整版）。
+
+引數的名字照各套件自己的：dexter 的作答資料是 `dataSrc`（`fit_enorm(dataSrc = X)`），immer 是 `dat`。
+kitsPreview（和 kits 一樣）叫 `data`：`kits_item(data = X)`。
+0.11.0 以前 kitsPreview 也叫 `dataSrc`；0.23.0 拿掉了這個舊名字，`kits_item(dataSrc = X)` 會停下來（`unused argument`）。
+
+### dexter
+
+```{r}
+fit <- dexter::fit_enorm(X)
+cf <- coef(fit)                          # item_id, item_score, beta, SE_beta
+max_abs(cf$beta, coef(item_dexter)$beta)
+```
+
+dexter 的 β 就是步驟參數，和本來就是 0。
+
+### immer
+
+immer 的參數是累加的：`b_ik` = β_i1 + ... + β_ik。
+步驟參數是相鄰兩個的差。
+
+```{r}
+fit <- immer::immer_cml(dat = as.data.frame(X), irtmodel = "PCM", normalization = "sum")
+step <- coef(item_dexter)$item_score
+beta <- fit$b - ifelse(step > 1, lag(fit$b, default = 0), 0)    # b_ik - b_i(k-1)
+beta <- beta - mean(beta)                                        # dexter 的原點
+max_abs(beta, coef(item_immer)$beta)
+```
+
+SE：`b = W par`，所以 β = D W par，共變異矩陣是 (D W) vcov (D W)'，D 是「相鄰相減」的矩陣。
+
+### `kits_code()`
+
+完整的程式（包括 SE 和門檻）：
+
+```{r}
+kits_code(item_immer)
+```
+
+
+## 8 成對的條件概似（CCML）：GSED 的估法
+
+GSED 的 D-score 用另一種條件估法：每次只看兩題，以這兩題的分數和為條件（Zwinderman, 1995）。
+給定兩題的和，θ 一樣消掉，所以它也不需要母體的模型。
+D-score 用 `sirt::rasch.pairwise.itemcluster()`，只處理 0/1 的題；immer 的 `immer_ccml()` 把它推廣到 PCM。
+
+kitsPreview 用 `engine = "ccml"`：
+
+```{r}
+item_ccml <- kits_item(X, engine = "ccml")
+item_ccml
+```
+
+直接用 immer 的話，`immer_ccml()` 要一個設計矩陣 `A`（題 × 類別 × 參數）。
+PCM 的第 h 類是前 h 步的和，所以 `A[i, h, l]` 在「參數 l 是第 i 題第 h 步或更前面」時是 1。
+
+```{r}
+max_k <- apply(X, 2, max, na.rm = TRUE)
+K <- max(max_k)
+step_rows <- tibble(item = rep(seq_along(max_k), max_k), step = sequence(max_k))
+A <- array(0, dim = c(ncol(X), K, nrow(step_rows)))
+for (l in seq_len(nrow(step_rows))) {
+  A[step_rows$item[l], step_rows$step[l]:K, l] <- 1
+}
+```
+
+`nlminb()` 預設的迭代次數不一定夠，所以提高到 5000：
+
+```{r}
+fit <- immer::immer_ccml(dat = as.data.frame(X), irtmodel = "PCM", A = A,
+                         control = list(iter.max = 5000, eval.max = 5000))
+beta_ccml <- fit$coef - mean(fit$coef)                           # dexter 的原點
+c(max_abs_vs_wrapper = max_abs(beta_ccml, coef(item_ccml)$beta),
+  max_abs_vs_cml = max_abs(beta_ccml, coef(item_dexter)$beta),
+  median_se_ratio = median(coef(item_ccml)$beta_se / coef(item_dexter)$beta_se))
+```
+
+* 自己寫的幾行和 `kits_item(X, engine = "ccml")` 一樣。
+
+* 這份模擬資料符合 PCM，所以 CCML 和 CML 只差抽樣誤差。
+* CCML 只用兩題兩題的資訊；這份資料上，SE 的中位數是 CML 的 `r round(median(coef(item_ccml)$beta_se / coef(item_dexter)$beta_se), 2)` 倍。
+* 資料不完全符合 PCM 時，兩者會不一樣：各自找「最接近」的 PCM。
+  真實 KIT 資料的比較在另一份教學文件（`kits_compare_TAM`）。
+
+`kits_code(item_ccml)` 寫出完整的程式（包括 SE 和門檻）。
+
+
+## 9 哪些步驟不分引擎
+
+* 門檻：一律從 β 算（`P(X ≥ k | θ) = 0.5`）。
+* 計分（`kits_subj()`）：一律是 dexter 的 WLE。
+* `kits_linking()`、`kits_linking_d()`（連結）：mean/sigma，base R。
+* `kits_drift()`（偏移）、`kits_itemfit()` 和 `kits_subj()` 的適配：只用門檻表。
+* 常模（cNORM）、DIF 和交互作用模型（dexter）：一律用同一個套件。
+
+所以兩個引擎的 `kits_item()` 結果，都可以直接交給後面的函數。
+
+
+## 參考文獻
+
+* de Leeuw, J., & Verhelst, N. (1986). Maximum likelihood estimation in generalized Rasch models. *Journal of Educational Statistics, 11*(3), 183–196. doi:10.3102/10769986011003183
+* Eggen, T. J. H. M., & Verhelst, N. D. (2011). Item calibration in incomplete testing designs. *Psicológica, 32*(1), 107–132.
+* Follmann, D. (1988). Consistent estimation in the Rasch model based on nonparametric margins. *Psychometrika, 53*(4), 553–562. doi:10.1007/BF02294407
+* Lindsay, B., Clogg, C. C., & Grego, J. (1991). Semiparametric estimation in the Rasch model and related exponential response models, including a simple latent class model for item analysis. *Journal of the American Statistical Association, 86*(413), 96–107. doi:10.1080/01621459.1991.10475008
+* Mislevy, R. J., & Wu, P.-K. (1996). *Missing responses and IRT ability estimation: Omits, choice, time limits, and adaptive testing* (ETS Research Report RR-96-30). doi:10.1002/j.2333-8504.1996.tb01708.x
+* Zwinderman, A. H. (1995). Pairwise parameter estimation in Rasch models. *Applied Psychological Measurement, 19*(4), 369–375. doi:10.1177/014662169501900406
+* Zwitser, R. J., & Maris, G. (2015). Conditional statistical inference with multistage testing designs. *Psychometrika, 80*(1), 65–84. doi:10.1007/s11336-013-9369-6

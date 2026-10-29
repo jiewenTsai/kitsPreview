@@ -1,0 +1,8 @@
+bibentry(
+  bibtype = "Manual",
+  title = "kitsPreview: Teaching Wrappers Around 'dexter', 'immer' and 'cNORM' for the KIT Developmental Scale",
+  author = person("Jie-Wen", "Tsai"),
+  year = "2026",
+  note = paste("R package version", meta$Version),
+  header = "To cite kitsPreview in publications use:"
+)

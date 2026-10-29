@@ -1,0 +1,53 @@
+Package: kitsPreview
+Title: Teaching Wrappers Around 'dexter', 'immer' and 'cNORM' for the KIT Developmental Scale
+Version: 0.25.0
+Authors@R: person("Jie-Wen", "Tsai", email = "tsai.jiewen@gmail.com", role = c("aut", "cre"))
+Description: Thin, teaching-oriented wrappers that show how each step of the
+    developmental scale of KIT (Kids in Taiwan: National Longitudinal Study of
+    Child Development and Care) is done directly with 'dexter', 'immer' and
+    'cNORM', and that check the numbers of the main package 'kits' (written in
+    'RTMB'). The functions have the same names, main arguments and printout
+    as 'kits', but their results have their own class names, so loading both
+    packages changes no method of 'kits'. The items are calibrated with the
+    partial credit model (Masters, 1982) <doi:10.1007/BF02296272> by
+    conditional maximum likelihood, in 'dexter' (the default) or 'immer'.
+    Both engines return the same table of step parameters on the same origin,
+    keep the package's own result, and write the few lines of the package's
+    own code that they ran. Cohorts are linked by mean/sigma (Marco, 1977)
+    <doi:10.1111/j.1745-3984.1977.tb00033.x> on the Thurstonian thresholds of
+    all steps, and domains with anchor items are linked to the D score of the
+    Global Scales for Early Development (Weber et al., 2019)
+    <doi:10.1136/bmjgh-2019-001724>. Person scores are weighted likelihood
+    estimates (Warm, 1989) <doi:10.1007/BF02294627>. Norms are continuous
+    sinh-arcsinh norms (Jones and Pewsey, 2009) <doi:10.1093/biomet/asp053>
+    fitted with 'cNORM' (Lenhard and Lenhard, 2021)
+    <doi:10.1177/0013164420928457>. Item and person fit, the formulas of every
+    step, and standalone code are provided.
+License: GPL-3
+Encoding: UTF-8
+Language: en-US
+Depends: R (>= 4.1.0)
+Imports:
+    cNORM (>= 3.7.0),
+    dexter (>= 1.8.0),
+    dplyr (>= 1.1.0),
+    graphics,
+    htmlwidgets,
+    plotly,
+    purrr (>= 1.0.0),
+    stats,
+    utils,
+    vctrs (>= 0.6.0)
+Suggests:
+    immer,
+    knitr,
+    quarto,
+    rmarkdown,
+    RTMB,
+    testthat (>= 3.0.0),
+    tidyr,
+    webshot2
+VignetteBuilder: quarto
+Config/testthat/edition: 3
+Roxygen: list(markdown = TRUE)
+Config/roxygen2/version: 8.1.0

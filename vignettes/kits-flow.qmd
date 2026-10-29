@@ -1,0 +1,852 @@
+---
+title: "kitsPreview 流程：從作答到常模"
+format:
+  html:
+    toc: true
+    grid:
+      body-width: 1000px
+vignette: >
+  %\VignetteIndexEntry{kitsPreview 流程：從作答到常模}
+  %\VignetteEngine{quarto::html}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(collapse = TRUE, comment = "#>")
+options(width = 110)
+show_plots <- nzchar(Sys.getenv("KITS_PLOTS"))   # 互動圖很大，套件內的版本不畫
+```
+
+這份教學用模擬資料，把 KIT 量尺的流程從頭走一次。
+資料是假的，但結構和 KIT 一樣。
+
+## 主要函數（第一梯隊）
+
+| 步驟 | 函數 | 做什麼 |
+|---|---|---|
+| 1 校準 | `kits_item()` | dexter 的 PCM，加上每個步驟的門檻 |
+| 2 世代連結 | `kits_linking()` | 把 M36 的量尺接到 M03 |
+| 3 接到 D | `kits_linking_d()` | 用錨題把 M03 的量尺接到 GSED 的 D |
+| 4 計分 | `kits_subj()`、`kits_subj_table()` | 每個孩子的 WLE；每個波次的原始分換算表（從分數來） |
+| 5 常模 | `kits_norm_screen()`、`kits_norm_ages()`、`kits_norms()`、`kits_norm_z()` | 篩波次、定月齡範圍、配常模（可以照組）、算同齡 z |
+| 6 檢查 | `kits_itemfit()`、`kits_inter()`、`plot()` | 題目、孩子、連結、常模配得好不好 |
+
+不需要連結時（只有一個世代），`kits()` 一步做完校準和計分。
+
+套件叫 kitsPreview；函數和 kits 同名，都以 `kits_` 開頭。
+輔助函數（第二梯隊）放在第 7、8 節：新的波次進來時的流程，以及題目分析和 KIT 報告的圖。
+第 9 節是每一步的公式和程式：`kits_equations()` 寫出公式，`kits_code()` 寫出可以直接執行的程式。
+
+## 資料格式
+
+作答和 dexter 一樣，是**矩陣**：
+
+* 一列一個人次（一個孩子在一個波次），一欄一題。
+* 列名是 visit_id（人次的編號：一個孩子的一次施測），每個人次一個；欄名是題號。
+* NA 是沒施測。
+* 寬的資料表用 `as.matrix()` 轉。
+* 一次只放一個領域的題目。
+
+孩子的資料（世代、波次、月齡、性別）放在另一個表 `persons`，計分時給 `kits_subj(X, item, persons = persons)`，照 visit_id 接上。
+孩子本身的編號（每一波都一樣）叫 `subj_id`。
+（kitsPreview 0.22.0 以前叫 `person_id`、`pid`；0.23.0 和 kits 一樣改名，0.24.1 起只認新名字。
+dexter 自己仍叫 `person_id`：kitsPreview 交給 dexter 時換成 dexter 的名字，結果再換回來。）
+之後常模的函數直接收分數表：`kits_norm_screen(s)`、`kits_norms(s)`、`kits_norm_z(s, norm)`（和 kits 相同的寫法）。
+少數函數要每人一個值（例如 `kits_inter()` 的 `wave_m`），給一個和矩陣的列同樣順序的向量。
+
+```{r}
+library(kitsPreview)
+```
+
+
+## 0 模擬資料
+
+一個領域（語言），14 題，每題 3 個分數（0、1、2），由易到難。
+M03 答第 1–8 題，M36 答第 5–12 題；第 13、14 題留給第 7 節的新波次。
+所以第 5–8 題是兩個世代的共同題。
+
+```{r}
+set.seed(11)
+betas <- lapply(seq(-3, 5, length.out = 14), function(b) b + c(-0.6, 0.6))
+names(betas) <- sprintf("lan%02d", 1:14)
+```
+
+每個波次 300 個孩子。
+M03 有 6、12、24 個月三波，M36 有 36、48 個月兩波。
+
+```{r}
+persons <- data.frame(cohort = rep(c("M03", "M03", "M03", "M36", "M36"), each = 300),
+                      wave_m = rep(c(6, 12, 24, 36, 48), each = 300))
+persons$visit_id <- paste(persons$cohort, persons$wave_m, 1:300, sep = "_")
+persons$age_m <- persons$wave_m + runif(1500, -1, 1)
+persons$sex <- sample(c("boy", "girl"), 1500, replace = TRUE)
+head(persons)
+```
+
+能力隨月齡成長。
+兩個世代各一個作答矩陣。
+
+```{r}
+theta <- 2 * log(persons$age_m / 12) + rnorm(1500, 0, 0.9)
+m03 <- persons$cohort == "M03"
+
+X03 <- kits_sim(theta[m03], betas[1:8])
+rownames(X03) <- persons$visit_id[m03]
+X36 <- kits_sim(theta[!m03], betas[5:12])
+rownames(X36) <- persons$visit_id[!m03]
+
+X03[1:3, ]
+```
+
+
+## 最簡單的用法：`kits()`
+
+只有一個世代、不需要連結時，`kits()` 一步做完。
+
+```{r}
+k <- kits(X03)
+k
+```
+
+`k$item` 是題目參數，`k$subj` 是每個孩子的能力。
+`plot(k)` 是 Wright map：左邊是孩子能力的分布，右邊是每題每個步驟的門檻，兩邊用同一個 θ 軸。
+
+```{r, eval = show_plots, out.width = "100%", fig.height = 5}
+plot(k)
+```
+
+KIT 有兩個世代，要先連結，所以下面把這兩步分開做。
+
+### 二點計分和混合計分
+
+上面的題目都是 0、1、2 分。
+只有 0、1 分的題（二點計分）也用同樣的函數，不用另外設定。
+
+**二點計分**：6 題，每題一個難度。
+
+```{r}
+betas_01 <- list(b1 = -2, b2 = -1, b3 = 0, b4 = 0.5, b5 = 1, b6 = 2)
+X_01 <- kits_sim(rnorm(500), betas_01, seed = 1)
+X_01[1:3, ]
+```
+
+```{r}
+k_01 <- kits(X_01)
+coef(k_01$item)
+```
+
+怎麼讀：
+
+* 每題只有一個步驟（`item_score` 都是 1）。
+* 這時 PCM 就是 Rasch 模型。
+* 門檻 `thr` 等於 `beta`：只有一個步驟時，得到 1 分以上的機率是 .5 的位置就是 β。
+
+```{r}
+max(abs(coef(k_01$item)$thr - coef(k_01$item)$beta))
+```
+
+**混合計分**：3 題二點計分，2 題 0–2 分，1 題 0–3 分。
+
+```{r}
+betas_mix <- list(m1 = -1.5, m2 = 0, m3 = 1.5,
+                  m4 = c(-1, 0), m5 = c(0, 1),
+                  m6 = c(-1, 0, 1))
+X_mix <- kits_sim(rnorm(500), betas_mix, seed = 2)
+X_mix[1:3, ]
+```
+
+```{r}
+k_mix <- kits(X_mix)
+coef(k_mix$item)
+```
+
+* 一題有幾個步驟，就有幾列（m6 有 3 列）。
+* 二點計分的題，門檻還是等於 `beta`；多點計分的題，門檻和 `beta` 不同。
+* 滿分 `raw_max` 是每題最高分加起來：3 × 1 + 2 × 2 + 3 = 10。
+
+```{r}
+head(k_mix$subj, 3)
+```
+
+後面的連結、計分、常模、檢查，二點計分和混合計分都一樣做。
+
+
+## 1 校準
+
+每個世代各估一次。
+
+```{r}
+item03 <- kits_item(X03)
+item36 <- kits_item(X36)
+item03
+```
+
+怎麼讀：
+
+* 校準預設用 dexter 的 `fit_enorm()`（PCM，CML）；dexter 自己的結果用 `kits_original(item03)` 拿。
+* 也可以換 immer 估（同一個 CML）：`engine = "immer"`（見 `vignette("engines", package = "kitsPreview")`）。
+* 一列是一題的一個步驟；`item_score` 是第幾步。
+* `beta` 是 dexter 的步驟參數。
+* `thr` 是門檻：能力在這裡時，得到 k 分以上的機率剛好是 .5。
+* 同一題的門檻一定由小到大；`beta` 不一定。
+* 第 1 步叫 milestone step，就是「通過」。
+* 全部的步驟：`coef(item03)`。
+
+印出來的數字是小數點下 2 位。
+物件裡的數字沒有被捨入。
+要看更多位數，用 `digits`：
+
+```{r}
+print(coef(item03)[1:3, ], digits = 4)
+coef(item03)$thr[1]
+```
+
+每次校準的原點都不一樣：dexter 把那次校準所有 β 的平均定為 0。
+所以 M03 和 M36 的量尺還不能直接比，要先連結。
+
+
+## 2 世代連結（M36 → M03）
+
+用共同題的所有步驟。
+每個步驟的門檻是一個點：M36 的值對 M03 的值。
+
+```{r}
+co <- kits_linking(from = item36, to = item03, n_boot = 2000)
+co
+```
+
+怎麼讀：
+
+* 這是一條直線：M03 量尺上的 θ = intercept + slope × M36 量尺上的 θ。
+  （Kolen & Brennan 把斜率叫 A、截距叫 B；kitsPreview 0.22.0 以前叫 `a`（截距）、`b`（斜率）。）
+* 括號裡是連結誤差：整題重抽 2,000 次（`n_boot = 2000`），每次都重新篩點。
+  0.23.0 起 `n_boot` 預設是 0（和 kits 相同），沒給時不算連結誤差，括號也不印。
+* `points from` 是點從哪裡來：共同題的每個步驟。
+* `points` 是點數（4 題共同題 × 2 步 = 8 個點）。
+* `dropped` 是篩掉的點：殘差超過 2 個 SD（`before screening` 那一行是篩點前的線和篩點的規則）。
+* 結果還是一個 list：`co$intercept`、`co$slope`、`co$points` 都可以直接取；`coef(co)` 給截距和斜率。
+* 舊程式的 `co$a`、`co$b` 會停下來，說要改用 `intercept`、`slope`。
+
+
+## 3 接到 D
+
+錨題是和 GSED 相同的題目。
+每題有 GSED 的難度 τ（單位是 D）。
+這裡假設有 5 題錨題；模擬時，τ 是 M03 門檻的一條直線加上誤差。
+
+```{r}
+milestone <- coef(item03)[coef(item03)$item_score == 1, ]
+anchors <- data.frame(item_id = c("lan01", "lan02", "lan03", "lan06", "lan07"))
+anchors$tau <- 60 + 7 * milestone$thr[match(anchors$item_id, milestone$item_id)] + rnorm(5, 0, 1.5)
+anchors
+```
+
+```{r}
+d_link <- kits_linking_d(item03, anchors, n_boot = 2000)
+d_link
+```
+
+怎麼讀：
+
+* D = intercept + slope × θ（θ 在 M03 量尺上）。
+* 每題錨題用 milestone step，一題一個點。
+
+KIT 的語言、動作、認知共用一條線。
+這時把三個領域放進一個有名字的 list：`kits_linking_d(list(lan = item_lan, motor = item_motor, cog = item_cog), anchors)`。
+結果多一個 `domains` 表：同樣的錨題，讓每個領域有自己的截距（斜率共用）。
+各領域的截距和共同的截距（`intercept`）很接近，就支持共用一條線。
+
+社會、情緒沒有錨題，也用同一條線。
+這樣它們的 D 是「和其他領域同單位的分數」，但不能讀成 GSED 的 D。
+
+
+## 4 計分
+
+### 4.1 每個孩子的 θ 和 D
+
+`kits_subj()` 的用法和 `dexter::ability(method = "WLE")` 一樣。
+`persons` 給孩子的資料（`cohort`、`wave_m`、`age_m`、`sex`），照 visit_id 接在後面。
+
+```{r}
+s36 <- kits_subj(X36, item36, persons = persons)
+head(s36)
+```
+
+怎麼讀：
+
+* `pattern_id` 是作答組合（item pattern：這個人次答了哪幾題）；dexter 叫它 booklet。
+* `raw` 是原始分；`raw_max` 是這個孩子答過的題目的滿分加總。
+* `theta`、`se` 和 `dexter::ability()` 相同；`theta` 在 M36 自己的量尺上。
+* `infit`、`outfit` 是個人適配（見第 6 節）；0 分和滿分是 NA。
+* `flag` 是判斷：`zero`（0 分）、`perfect`（滿分）、`misfit`（infit 或 outfit 大於 2）、`ok`。
+* dexter 的 WLE 有時算不出來（題目很少、分數在兩端）。
+  這時 `kits_subj()` 用另一種算法算出同一個 WLE，並顯示一則訊息。
+* 最後幾欄是 `persons` 的 `wave_m`、`age_m`、`sex`、`cohort`。
+
+M36 先用世代連結轉到 M03 的量尺。
+SE 也乘上斜率。
+
+```{r}
+s36$theta <- co$intercept + co$slope * s36$theta
+s36$se <- co$slope * s36$se
+```
+
+M03 是參考世代，不用轉。
+兩個世代疊起來，再用 D 連結換成 D。
+和 kits 一樣，換算後的分數還是放在 `theta`、`se`（現在是 D 的單位）。
+
+```{r}
+s03 <- kits_subj(X03, item03, persons = persons)
+lan <- rbind(s03, s36)
+lan$theta <- d_link$intercept + d_link$slope * lan$theta
+lan$se <- d_link$slope * lan$se
+lan |>
+  dplyr::select(visit_id, cohort, wave_m, age_m, raw, raw_max, theta, se) |>
+  head()
+```
+
+每條連結都是直線。
+所以在同一個世代內，D 和原本的 WLE 相關是 1。
+
+### 4.2 原始分換算表
+
+每個波次用最多人作答的作答組合（標準題本，standard form）。
+每個原始分對應一個 θ，也列出這一波有幾個孩子拿到這個分數。
+表從分數來：分數記得題目參數和每個作答組合的題目，`wave_m` 來自 `persons`。
+
+```{r}
+tab03 <- s03 |>
+  kits_subj_table()
+tab03$D <- d_link$intercept + d_link$slope * tab03$theta
+tab03$D_se <- d_link$slope * tab03$se
+tab03 |>
+  dplyr::filter(wave_m == 12) |>
+  dplyr::select(wave_m, n_items, raw, theta, D, D_se, n, cum_pct, form_pct)
+```
+
+怎麼讀：
+
+* 一列是一個波次的一個原始分（0 到滿分）。
+* `theta` 在 `item03` 的量尺上；換成 D 和個人分數一樣，是兩條直線。
+  （kitsPreview 不記分數換過的尺，所以表一律在校準的量尺上；kits 的表會照分數換過的尺換。）
+* `n`、`cum_pct` 是這一波答標準題本的孩子的次數分配。
+* `form_pct` 是答標準題本的孩子佔這一波的百分比。
+  答其他題目組合的孩子不在這張表裡；他們的分數看 `kits_subj()`。
+
+每個作答組合都要一張表時，用 `forms = "all"`：`form` 1 是標準題本，2 是第二多人答的，以此類推。
+題目組合在 `attr(tab, "forms")`。
+
+```{r}
+tab_all <- kits_subj_table(s03, forms = "all")
+attr(tab_all, "forms")
+```
+
+M36 的換算表一樣做，先用 `co` 轉到 M03 量尺，再換成 D。
+
+```{r}
+tab36 <- kits_subj_table(s36)
+tab36$theta <- co$intercept + co$slope * tab36$theta
+tab36$D <- d_link$intercept + d_link$slope * tab36$theta
+head(tab36[, c("wave_m", "raw", "D", "n")])
+```
+
+
+## 5 常模
+
+KIT 用 cNORM 的 shash 模型。
+分數可以是 0 或負數，不用加常數。
+
+**5.1 篩波次。**
+一個波次有 20% 以上的孩子拿到這一波的最低分，就不放進常模：分數堆在最低分，看不出誰落後。
+兩個世代都有的波次分開算，所以要有世代。
+分數表直接給：分數是 `theta`（這裡已經是 D），波次和世代來自它的 `wave_m`、`cohort` 欄。
+（向量的寫法是 `kits_norm_screen(lan$theta, lan$wave_m, cohort = lan$cohort)`。）
+
+```{r}
+screen <- kits_norm_screen(lan)
+screen
+```
+
+這份模擬資料每一波都放進常模。
+KIT 的社會 6 個月、語言 3 個月就被篩掉。
+
+`screen$normed` 是每個孩子放不放進常模（`TRUE`／`FALSE`），順序和輸入相同。
+
+```{r}
+use <- lan[screen$normed, ]
+```
+
+**5.2 月齡範圍。**
+從第一個波次的第 1 百分位，到最後一個波次的第 99 百分位。
+少數特別小或特別大的孩子，不會把常模拉到沒有資料的月齡。
+
+```{r}
+ages <- kits_norm_ages(use)
+range(ages)
+```
+
+**5.3 配常模。**
+給分數表、不給 `ages` 時，`kits_norms()` 就用上面的規則，並且 `pad = 0`：只用 `ages` 範圍內的資料，所以不用自己先篩月齡。
+（向量的寫法 `kits_norms(use$theta, use$age_m, ages, pad = 0, ...)` 給同樣的常模。）
+模擬資料少，多項式的次數用小一點（KIT 用預設值）。
+
+```{r}
+norm <- kits_norms(use, degrees = c(3, 2, 1, 1))
+head(norm[, c("age_m", "mu", "sigma", "epsilon", "delta", "P10", "P50", "P90")])
+```
+
+怎麼讀：
+
+* 一列一個月齡（每半個月一列）。
+* `mu`、`sigma`、`epsilon`、`delta` 是這個月齡的分布：位置、尺度、偏態、尾巴。
+* `P3` 到 `P97` 是百分位。
+* `cnorm.shash()` 有多個局部解，所以 `kits_norms()` 用幾個起始值各配一次，留下概似最大的解。
+  cNORM 自己的結果（留下的那個解）：`kits_original(norm)`。
+
+`plot(norm)` 畫百分位曲線；給 `scores`（有 `theta`、`age_m` 的分數表）時，孩子的分數畫成灰點。
+
+```{r, eval = show_plots, out.width = "100%", fig.height = 5}
+plot(norm, scores = lan)
+```
+
+**5.4 同齡 z 與天花板。**
+`kits_norm_z()` 給分數表時，回傳同一張表，多兩欄：`z` 和 `pct`（百分等級，`100 * pnorm(z)`）。
+
+```{r}
+lan <- lan |>
+  kits_norm_z(norm)
+```
+
+z 在下面三種情況設成 NA：
+
+* 月齡在常模範圍外：`kits_norm_z()` 已經是 NA。
+* 波次沒有放進常模。
+* 滿分：真正的能力不知道有多高，只報「已達天花板」。
+
+```{r}
+lan$status <- "ok"
+lan$status[lan$raw == lan$raw_max] <- "at ceiling"
+lan$status[is.na(lan$z)] <- "age outside norm"
+lan$status[!screen$normed] <- "wave not normed"
+table(lan$wave_m, lan$status)
+```
+
+最後把不是 "ok" 的 z 和百分等級設成 NA。
+（下一節的檢查要用設成 NA 之前的 z，所以先留一份。）
+
+```{r}
+lan$z_all <- lan$z
+lan$z[lan$status != "ok"] <- NA
+lan$pct[lan$status != "ok"] <- NA
+head(lan[, c("visit_id", "wave_m", "theta", "z", "pct", "status")])
+```
+
+
+## 6 檢查：配得好不好
+
+每一步都有可以檢查的地方。
+沒有一個數字能說「好」或「不好」；要幾個一起看。
+
+### 6.1 題目
+
+`kits_itemfit()`：每題一列。
+`kits_item()` 已經在同一份資料上算好同一張表，存在 `item03$itemfit`（和下面完全相同；印出 `item03` 的最後一行是摘要，
+`plot(item03, type = "fit")` 畫出來）；`kits_itemfit()` 用來以同樣的題目檢查別的資料。
+
+```{r}
+kits_itemfit(X03, item03)
+```
+
+怎麼讀：
+
+* `rir`：這題和其他題總分的相關（item-rest；dexter 的 `tia_tables()` 的 `rir`）。太低（例如 0.2 以下）表示這題和其他題量的不太一樣。
+* `infit`、`outfit`：殘差的均方，期望值是 1。
+  大於 1 表示作答比模型預期的亂；小於 1 表示比預期的整齊。
+  `outfit` 對離題目很遠的意外作答比較敏感（猜對、粗心）。
+* 一般問卷常用 0.6 到 1.4 當參考範圍。
+* **題數少時，均方會低於 1**：每個孩子的 θ 是用同樣的作答估的。
+  模擬資料符合模型時，每人 5 題的 infit 平均約 0.83，10 題約 0.92，20 題約 0.96。
+  所以題數少的作答組合要拿題目互相比，不要只拿去和 1 比。
+
+`kits_inter()`：dexter 的交互作用模型，每個波次的標準題本各跑一次。
+每題的 `sigma` 是 0 表示符合 PCM；`fit_IM` 約是 sigma 除以 SE，絕對值大於 2 要注意。
+
+```{r}
+inter <- kits_inter(X03, wave_m = persons$wave_m[m03])
+inter
+```
+
+`plot()` 畫 dexter 的題目–總分回歸：每個總分的平均題目得分（點），PCM 的預測（線）。
+點離線很遠的題目，不符合 PCM。
+
+```{r, fig.width = 6, fig.height = 4}
+plot(inter, wave = 12, items = "lan05")
+```
+
+### 6.2 孩子
+
+個人適配在 `kits_subj()` 的結果裡（`infit`、`outfit`、`flag`）。
+`misfit` 的孩子，作答型態很意外（例如簡單的題錯、難的題對），可以回頭看他的資料。
+
+```{r}
+table(lan$wave_m, lan$flag)
+lan |>
+  dplyr::arrange(dplyr::desc(outfit)) |>
+  dplyr::select(visit_id, wave_m, raw, infit, outfit, flag) |>
+  head(3)
+```
+
+信度：同一波次裡，孩子之間的差異有多少不是測量誤差。
+用 1 − 平均 SE² ／ θ 的變異數，每個波次一個。
+
+```{r}
+lan |>
+  dplyr::summarise(reliability = 1 - mean(se^2) / var(theta), .by = wave_m)
+```
+
+### 6.3 連結
+
+`plot()` 畫每個點和連結線。
+點大致落在線上，連結才可信；被篩掉的點用橘色的 × 標出。
+滑鼠停在點上可以看題號和殘差。
+
+```{r, eval = show_plots, out.width = "100%", fig.height = 4.5}
+plot(co)
+plot(d_link)
+```
+
+數字也可以直接看：
+
+* `co$intercept_error`、`co$slope_error`：世代連結的誤差。
+  換成 D 是 `d_link$slope * co$intercept_error`，可以和孩子的 `se`（D 的單位）比。
+* `d_link$intercept_error`：D 連結的誤差（單位就是 D）。
+  這裡只有 5 題錨題，所以誤差很大；它影響的是「和 GSED 比」，不影響 KIT 孩子之間的比較。
+* `co$points`：每個點的殘差（`resid_final`）。
+* `co$intercept0`、`co$slope0`：篩點前的線；和篩點後差很多時，要看被篩掉的是哪幾題。
+* 多個領域共用一條 D 連結時：`d_link$domains` 的各領域截距。
+
+```{r}
+c(cohort_link_error_in_D = d_link$slope * co$intercept_error,
+  D_link_error = d_link$intercept_error,
+  median_child_D_se = median(lan$se))
+```
+
+```{r}
+co$points |>
+  dplyr::arrange(dplyr::desc(abs(resid_final))) |>
+  dplyr::select(id, from, to, resid_final, dropped) |>
+  head(3)
+```
+
+### 6.4 常模
+
+各波次的同齡 z，平均應該接近 0、SD 接近 1。
+要包括滿分的孩子，所以用設成 NA 之前的 `z_all`。
+
+```{r}
+lan |>
+  dplyr::filter(status %in% c("ok", "at ceiling")) |>
+  dplyr::summarise(mean = mean(z_all), sd = sd(z_all), .by = wave_m)
+```
+
+
+## 7 新的波次進來（第二梯隊：`kits_drift()`）
+
+假設 M36 有兩個新的波次：60、72 個月，各 300 個孩子。
+這兩波加了兩題新題 lan13、lan14；另外 lan10 變容易了（偏移）。
+
+```{r}
+new <- data.frame(cohort = "M36", wave_m = rep(c(60, 72), each = 300))
+new$visit_id <- paste(new$cohort, new$wave_m, 1:300, sep = "_")
+new$age_m <- new$wave_m + runif(600, -1, 1)
+new$sex <- sample(c("boy", "girl"), 600, replace = TRUE)
+
+new_betas <- betas[5:14]
+new_betas$lan10 <- new_betas$lan10 - 1.2
+X_new <- kits_sim(2 * log(new$age_m / 12) + rnorm(600, 0, 0.9), new_betas)
+rownames(X_new) <- new$visit_id
+```
+
+**幾波一起進來時，疊成一個矩陣。**
+資料越多，偏移越容易看出來。
+
+### 7.1 哪些題偏移
+
+新資料自己校準一次，和 `item36` 的門檻比。
+
+```{r}
+drift <- kits_drift(X_new, item36)
+drift$items
+```
+
+怎麼讀：
+
+* `drift = TRUE`：這題的門檻離其他題的線太遠，在新資料裡變了。
+* `drift` 是 NA 的題不判斷，最後一欄 `reason` 寫原因；例如幾乎每個孩子都通過的題，資訊不夠。
+* `suggest_fix`：建議固定的題（沒有偏移，或資訊太少、固定也無妨）。
+* 新題（lan13、lan14）不在 `item36` 裡，不判斷。
+
+### 7.2 固定參數校準
+
+`drift$fix` 是建議固定的題在 `item36` 的參數，直接交給 `kits_item()`。
+其他題（偏移的題、新題）重新估。
+
+```{r}
+drift$fix
+item_new <- kits_item(X_new, fixed_params = drift$fix)
+coef(item_new)[coef(item_new)$item_id %in% c("lan10", "lan13", "lan14"), ]
+```
+
+看完 `drift$items` 想改名單時，直接改這個表，例如 `subset(drift$fix, item_id != "lan06")`。
+
+固定參數要用某個世代自己的量尺（這裡是 M36）。
+PCM 的斜率固定是 1；轉換過的參數（b ≠ 1）已經不是 PCM 參數，不能拿來固定。
+
+### 7.3 計分與連結
+
+新資料已經在 M36 的量尺上，所以沿用原本的 `co` 和 `d_link`。
+
+```{r}
+lan_new <- kits_subj(X_new, item_new, persons = new)
+lan_new$theta <- co$intercept + co$slope * lan_new$theta
+lan_new$se <- co$slope * lan_new$se
+lan_new$theta <- d_link$intercept + d_link$slope * lan_new$theta
+lan_new$se <- d_link$slope * lan_new$se
+kits_vertical(lan_new)
+```
+
+新題每個步驟的 D：
+
+```{r}
+new_items <- coef(item_new)[coef(item_new)$item_id %in% c("lan13", "lan14"), ]
+new_items$D <- d_link$intercept + d_link$slope * (co$intercept + co$slope * new_items$thr)
+new_items[, c("item_id", "item_score", "thr", "D")]
+```
+
+### 7.4 常模
+
+原本的常模只到 `r max(norm$age_m)` 個月，新的波次超出這個範圍。
+所以常模要用所有波次重配，步驟和第 5 節一樣。
+
+```{r}
+all_waves <- rbind(lan[names(lan_new)], lan_new)
+screen_all <- kits_norm_screen(all_waves)
+use_all <- all_waves[screen_all$normed, ]
+norm_all <- kits_norms(use_all, degrees = c(3, 2, 1, 1))
+range(norm_all$age_m)
+```
+
+### 分批進來時
+
+波次一次一次進來時，每次都做 7.1 到 7.4。
+每次都固定在**原本的** `item36`，不要固定在上一次更新的結果：
+一次一次接下去，每次的小誤差會累積。
+上一次的新題（例如 lan13、lan14）可以加進固定的參數：
+
+```{r, eval = FALSE}
+ref <- rbind(coef(item36), coef(item_new)[coef(item_new)$item_id %in% c("lan13", "lan14"), ])
+drift_next <- kits_drift(X_next, ref)
+item_next <- kits_item(X_next, fixed_params = drift_next$fix)
+```
+
+
+## 8 題目分析和 KIT 報告的圖（第二梯隊）
+
+### 8.1 每題 50% 通過的月齡：`kits_age_pass()`
+
+月齡範圍要夠寬，所以兩個世代一起算。
+兩個世代的題目不同：先補成同樣的欄（沒答的題是 NA），再疊起來。
+
+```{r}
+items <- union(colnames(X03), colnames(X36))
+X_all <- matrix(NA, nrow(persons), length(items), dimnames = list(persons$visit_id, items))
+X_all[rownames(X03), colnames(X03)] <- X03
+X_all[rownames(X36), colnames(X36)] <- X36
+
+age_pass <- kits_age_pass(X_all, age_m = persons$age_m, wave_m = persons$wave_m)
+age_pass
+```
+
+分數至少 `step`（預設 1，milestone step）是「通過」；`p50` 是 50% 通過的月齡。
+`separated` 是完全分離（年幼的都沒通過、年長的都通過）：這時月齡只知道在 `age_last_fail` 和 `age_first_pass` 之間。
+`p = c(0.5, 0.75)` 一次給幾個比例。
+通過率在觀察到的月齡裡沒有跨過一半的題，是 NA。
+例如最簡單的幾題，6 個月就超過一半的孩子通過；
+只有 M36 答的題，36 個月時已經超過一半，前面又沒有資料。
+這些題在下面的圖上，改用常模中位數到達的月齡。
+
+### 8.2 性別 DIF：`kits_dif()`、`kits_dif_combine()`
+
+每個世代各算一次；`sex` 給每一列的性別。
+正的值表示對男孩比較難（偏向女孩）。
+兩個世代的結果再合併判斷（預設門檻 0.3 logit）。
+
+```{r}
+dif03 <- kits_dif(X03, sex = persons$sex[m03])
+dif36 <- kits_dif(X36, sex = persons$sex[!m03])
+dif <- kits_dif_combine(dif03, dif36)
+dif
+```
+
+模擬資料沒有 DIF，所以超過門檻的題是隨機誤差。
+幾乎每個孩子都通過的題，估計特別不穩。
+所以 DIF 要兩個世代一起看（`DIF` 欄），也要看題目內容。
+
+### 8.3 題目表和成長曲線圖：`kits_item_table()`
+
+每題放在 milestone step 的 D。
+兩個世代的門檻先各自換到 D（M36 先用 `co` 轉到 M03 量尺），再一起交給 `kits_item_table()`；
+兩個世代都有的題，留第一個（M03）的，並說一聲。
+表也帶著常模，所以常模要有領域：`by = "domain"`（分數表加一欄 `domain`）。
+
+```{r}
+use$domain <- "lan"
+norm_lan <- kits_norms(use, degrees = c(3, 2, 1, 1), by = "domain")
+```
+
+```{r}
+thr03 <- coef(item03)
+thr03$thr <- d_link$intercept + d_link$slope * thr03$thr
+thr36 <- coef(item36)
+thr36$thr <- d_link$intercept + d_link$slope * (co$intercept + co$slope * thr36$thr)
+stems <- stats::setNames(paste("Example item", items), items)
+```
+
+```{r}
+item_tab <- kits_item_table(list(thr03, thr36), norm_lan, age_pass = age_pass, dif = dif,
+                            stems = stems)
+head(item_tab[, c("item_id", "domain", "D", "age50", "age_reach", "x", "DIF")])
+```
+
+`x` 是題目在圖上的月齡：有 50% 通過月齡就用它，沒有就用常模中位數到達這個 D 的月齡。
+`plot()` 畫成長曲線和題目（`type = "growth"`，預設）：
+
+```{r, eval = show_plots, out.width = "100%", fig.height = 5}
+plot(item_tab, y_range = c(0, 140))
+```
+
+### 8.4 成長階梯：`plot(item_tab, type = "ladder")`
+
+右側的刻度是常模中位數到達這個 D 的月齡（`ages`）。
+
+```{r, eval = show_plots, out.width = "100%", fig.height = 7}
+plot(item_tab, type = "ladder", ages = c(6, 12, 24, 36, 48))
+```
+
+### 8.5 兩世代的中位數：`kits_vertical()`
+
+每個世代 × 波次一列：人數、實際月齡的中位數、平均、SD、中位數、P25、P75。
+
+```{r}
+v <- kits_vertical(lan)
+v
+```
+
+`plot(v, type = "median")` 畫中位數（P25 到 P75），點在實際月齡的中位數；兩個世代都有的波次，點應該很近。
+
+```{r, eval = show_plots, out.width = "100%", fig.height = 4.5}
+plot(v, type = "median")
+```
+
+### 8.6 男女的常模：`kits_norms(by = )`
+
+`by` 一組配一個常模；每組的常模和只用這組的孩子配的完全相同。
+結果是一張表，組的欄在前面；`plot()` 一組一格，`scores` 給的孩子畫在自己那一組。
+
+```{r}
+norms_sex <- kits_norms(use, degrees = c(3, 2, 1, 1), by = c("domain", "sex"))
+head(norms_sex[, c("domain", "sex", "age_m", "P10", "P50", "P90")], 3)
+```
+
+```{r, eval = show_plots, out.width = "100%", fig.height = 4.5}
+plot(norms_sex, scores = use)
+```
+
+`kits_norm_z(s, norms_sex)` 把每個孩子放在自己那一組的曲線上（`s` 要有 `domain`、`sex` 欄）。
+
+每組的常模在 `attr(norms_sex, "groups")`，名字是組的值（幾欄時用 `.` 接起來）：
+
+```{r}
+names(attr(norms_sex, "groups"))
+```
+
+`kits_code()` 一次寫一組的程式，例如 `kits_code(attr(norms_sex, "groups")[["lan.boy"]])`。
+
+### 8.7 其他
+
+* `kits_save_plot(p, "fig.html", "fig.png")`：存成互動 html 和靜態 png（png 需要 webshot2 和瀏覽器）。
+* 圖上的字是英文；要改標題：`plotly::layout(p, title = "...")`。
+* `kits_subj_table(item03)`：每個作答組合的原始分換算表（和 `dexter::ability_tables()` 相同，但每一列都算得出來）。
+* 連結的三步（`?kits_link_steps`）：自己準備連結的點，一步一步做。例如只用共同題的 milestone step：
+
+```{r}
+points <- dplyr::inner_join(coef(item36), coef(item03), by = c("item_id", "item_score")) |>
+  dplyr::filter(item_score == 1) |>
+  dplyr::transmute(id = item_id, item = item_id, from = thr.x, to = thr.y)
+points |>
+  kits_link_screen() |>
+  kits_link_line()
+```
+
+* 0.22.0 被取代的函數（`kits_age50()`、`kits_mean_sigma()`、`kits_wle_table()`、`kits_item_positions()`、`kits_ladder_marks()`、
+  `kits_plot_growth()`、`kits_plot_ladder()`、`kits_plot_cohort()`、`kits_plot_norms()`）在 0.23.0 拿掉；新的寫法見 NEWS。
+
+* `kits_sim()`：模擬作答，給小例子用。
+
+
+## 9 公式與程式
+
+每一步的公式和程式都可以取出來。
+它們的符號相同；程式的數字也和套件相同（都在套件的測試裡驗證過）。
+
+### 9.1 公式：`kits_equations()`
+
+給一個結果，或給主題（`"item"`、`"subj"`、`"fit"`、`"link"`、`"norms"`）。
+
+```{r}
+kits_equations("subj")
+```
+
+連結會多一段這條線本身的數字：
+
+```{r}
+kits_equations(co)
+```
+
+`format = "latex"` 給 LaTeX 的 `aligned` 區塊，可以直接貼進論文。
+
+```{r}
+head(as.character(kits_equations("item", format = "latex")), 4)
+```
+
+### 9.2 程式：`kits_code()`
+
+程式不需要 kits，只用 kitsPreview 呼叫的原本套件（dexter、immer、cNORM）和 base R。
+從頭用 RTMB 寫的估計在 kits 的教學腳本裡。
+
+連結是封閉解，只用 base R：
+
+```{r}
+kits_code(co)
+```
+
+題目和能力的程式比較長，寫到檔案再看：
+
+```{r, eval = FALSE}
+kits_code(k, file = "kits_dexter.R")          # 需要 X
+kits_code(norm, file = "norm_cnorm.R")        # 需要 D、age_m（D 是 use$theta）
+```
+
+`kits_code(k)` 的開頭幾行：
+
+```{r}
+head(kits_code(k), 20)
+```
+
+
+## 引用
+
+`citation("kitsPreview")` 是 kitsPreview 本身。
+用到的方法，原始文獻列在 `?kitsPreview` 和 `?kits_item` 的 References，例如 PCM（Masters, 1982）、WLE（Warm, 1989）、
+mean/sigma（Marco, 1977）、D score（Weber et al., 2019）、shash（Jones & Pewsey, 2009）、
+cNORM（Lenhard & Lenhard, 2021）、dexter（Maris et al.）。
